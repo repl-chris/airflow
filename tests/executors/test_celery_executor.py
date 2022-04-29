@@ -17,10 +17,13 @@
 # under the License.
 import contextlib
 import json
+import logging
 import os
 import signal
 import sys
+import time
 import unittest
+from collections import namedtuple
 from datetime import datetime, timedelta
 from unittest import mock
 
@@ -32,13 +35,14 @@ from celery.backends.base import BaseBackend, BaseKeyValueStoreBackend
 from celery.backends.database import DatabaseBackend
 from celery.contrib.testing.worker import start_worker
 from celery.result import AsyncResult
+from freezegun import freeze_time
 from kombu.asynchronous import set_event_loop
 from parameterized import parameterized
 
 from airflow.configuration import conf
 from airflow.exceptions import AirflowException, AirflowTaskTimeout
 from airflow.executors import celery_executor
-from airflow.executors.celery_executor import BulkStateFetcher
+from airflow.executors.celery_executor import BulkStateFetcher, CeleryExecutor
 from airflow.models.baseoperator import BaseOperator
 from airflow.models.dag import DAG
 from airflow.models.taskinstance import SimpleTaskInstance, TaskInstance, TaskInstanceKey
@@ -94,12 +98,12 @@ def _prepare_app(broker_url=None, execute=None):
             set_event_loop(None)
 
 
-class TestCeleryExecutor(unittest.TestCase):
-    def setUp(self) -> None:
+class TestCeleryExecutor:
+    def setup_method(self) -> None:
         db.clear_db_runs()
         db.clear_db_jobs()
 
-    def tearDown(self) -> None:
+    def teardown_method(self) -> None:
         db.clear_db_runs()
         db.clear_db_jobs()
 
@@ -184,7 +188,7 @@ class TestCeleryExecutor(unittest.TestCase):
                 'command',
                 1,
                 None,
-                SimpleTaskInstance(ti=TaskInstance(task=task, run_id=None)),
+                SimpleTaskInstance.from_ti(ti=TaskInstance(task=task, run_id=None)),
             )
             key = ('fail', 'fake_simple_ti', when, 0)
             executor.queued_tasks[key] = value_tuple
@@ -196,10 +200,10 @@ class TestCeleryExecutor(unittest.TestCase):
     @pytest.mark.integration("redis")
     @pytest.mark.integration("rabbitmq")
     @pytest.mark.backend("mysql", "postgres")
-    def test_retry_on_error_sending_task(self):
+    def test_retry_on_error_sending_task(self, caplog):
         """Test that Airflow retries publishing tasks to Celery Broker at least 3 times"""
 
-        with _prepare_app(), self.assertLogs(celery_executor.log) as cm, mock.patch.object(
+        with _prepare_app(), caplog.at_level(logging.INFO), mock.patch.object(
             # Mock `with timeout()` to _instantly_ fail.
             celery_executor.timeout,
             "__enter__",
@@ -217,7 +221,7 @@ class TestCeleryExecutor(unittest.TestCase):
                 'command',
                 1,
                 None,
-                SimpleTaskInstance(ti=TaskInstance(task=task, run_id=None)),
+                SimpleTaskInstance.from_ti(ti=TaskInstance(task=task, run_id=None)),
             )
             key = ('fail', 'fake_simple_ti', when, 0)
             executor.queued_tasks[key] = value_tuple
@@ -227,28 +231,19 @@ class TestCeleryExecutor(unittest.TestCase):
             assert dict(executor.task_publish_retries) == {key: 2}
             assert 1 == len(executor.queued_tasks), "Task should remain in queue"
             assert executor.event_buffer == {}
-            assert (
-                "INFO:airflow.executors.celery_executor.CeleryExecutor:"
-                f"[Try 1 of 3] Task Timeout Error for Task: ({key})." in cm.output
-            )
+            assert f"[Try 1 of 3] Task Timeout Error for Task: ({key})." in caplog.text
 
             executor.heartbeat()
             assert dict(executor.task_publish_retries) == {key: 3}
             assert 1 == len(executor.queued_tasks), "Task should remain in queue"
             assert executor.event_buffer == {}
-            assert (
-                "INFO:airflow.executors.celery_executor.CeleryExecutor:"
-                f"[Try 2 of 3] Task Timeout Error for Task: ({key})." in cm.output
-            )
+            assert f"[Try 2 of 3] Task Timeout Error for Task: ({key})." in caplog.text
 
             executor.heartbeat()
             assert dict(executor.task_publish_retries) == {key: 4}
             assert 1 == len(executor.queued_tasks), "Task should remain in queue"
             assert executor.event_buffer == {}
-            assert (
-                "INFO:airflow.executors.celery_executor.CeleryExecutor:"
-                f"[Try 3 of 3] Task Timeout Error for Task: ({key})." in cm.output
-            )
+            assert f"[Try 3 of 3] Task Timeout Error for Task: ({key})." in caplog.text
 
             executor.heartbeat()
             assert dict(executor.task_publish_retries) == {}
@@ -411,6 +406,177 @@ class TestCeleryExecutor(unittest.TestCase):
         assert executor.running == {key_2}
         assert executor.adopted_task_timeouts == {key_2: queued_dttm_2 + executor.task_adoption_timeout}
 
+    @pytest.mark.backend("mysql", "postgres")
+    @pytest.mark.parametrize(
+        "state, queued_dttm, executor_id",
+        [
+            (State.SCHEDULED, timezone.utcnow() - timedelta(days=2), '231'),
+            (State.QUEUED, timezone.utcnow(), '231'),
+            (State.QUEUED, timezone.utcnow(), None),
+        ],
+    )
+    def test_stuck_queued_tasks_are_cleared(
+        self, state, queued_dttm, executor_id, session, dag_maker, create_dummy_dag, create_task_instance
+    ):
+        """Test that clear_stuck_queued_tasks works"""
+        ti = create_task_instance(state=State.QUEUED)
+        ti.queued_dttm = queued_dttm
+        ti.external_executor_id = executor_id
+        ti.dag_run.state = State.RUNNING
+        session.merge(ti)
+        session.flush()
+        executor = celery_executor.CeleryExecutor()
+        executor.tasks = {ti.key: AsyncResult("231")}
+        executor._clear_stuck_queued_tasks()
+        session.flush()
+        ti = session.query(TaskInstance).filter(TaskInstance.task_id == ti.task_id).one()
+        assert ti.state == state
+
+    @pytest.mark.backend("mysql", "postgres")
+    def test_task_in_queued_tasks_dict_are_cleared(
+        self, session, dag_maker, create_dummy_dag, create_task_instance
+    ):
+        """Test that clear_stuck_queued_tasks clears tasks in executor.queued_tasks"""
+        ti = create_task_instance(state=State.QUEUED)
+        ti.queued_dttm = timezone.utcnow() - timedelta(days=2)
+        ti.external_executor_id = '231'
+        ti.dag_run.state = State.RUNNING
+        session.merge(ti)
+        session.flush()
+        executor = celery_executor.CeleryExecutor()
+        executor.tasks = {ti.key: AsyncResult("231")}
+        executor.queued_tasks = {ti.key: AsyncResult("231")}
+        executor._clear_stuck_queued_tasks()
+        session.flush()
+        ti = session.query(TaskInstance).filter(TaskInstance.task_id == ti.task_id).one()
+        assert executor.tasks == {}
+        assert executor.queued_tasks == {}
+        assert ti.state == State.SCHEDULED
+
+    @pytest.mark.backend("mysql", "postgres")
+    def test_task_in_running_dict_are_cleared(
+        self, session, dag_maker, create_dummy_dag, create_task_instance
+    ):
+        """Test that clear_stuck_queued_tasks clears tasks in executor.running"""
+        ti = create_task_instance(state=State.QUEUED)
+        ti.queued_dttm = timezone.utcnow() - timedelta(days=2)
+        ti.external_executor_id = '231'
+        ti.dag_run.state = State.RUNNING
+        session.merge(ti)
+        session.flush()
+        executor = celery_executor.CeleryExecutor()
+        executor.tasks = {ti.key: AsyncResult("231")}
+        executor.running = {ti.key}
+        executor._clear_stuck_queued_tasks()
+        session.flush()
+        ti = session.query(TaskInstance).filter(TaskInstance.task_id == ti.task_id).one()
+        assert executor.tasks == {}
+        assert executor.running == set()
+        assert ti.state == State.SCHEDULED
+
+    @mock.patch("celery.backends.database.DatabaseBackend.ResultSession")
+    @pytest.mark.backend("mysql", "postgres")
+    @freeze_time("2020-01-01")
+    @pytest.mark.parametrize(
+        "state",
+        [
+            (State.SCHEDULED),
+            (State.QUEUED),
+        ],
+    )
+    def test_the_check_interval_to_clear_stuck_queued_task_is_correct(
+        self,
+        mock_result_session,
+        state,
+        session,
+        dag_maker,
+        create_dummy_dag,
+        create_task_instance,
+    ):
+        if state == State.SCHEDULED:
+            last_check_time = time.time() - 302  # should clear ti state
+        else:
+            last_check_time = time.time() - 298  # should not clear ti state
+
+        ti = create_task_instance(state=State.QUEUED)
+        ti.queued_dttm = timezone.utcnow() - timedelta(days=2)
+        ti.external_executor_id = '231'
+        ti.dag_run.state = State.RUNNING
+        session.merge(ti)
+        session.flush()
+        executor = celery_executor.CeleryExecutor()
+        executor.tasks = {ti.key: AsyncResult("231")}
+        executor.stuck_tasks_last_check_time = last_check_time
+        executor.sync()
+        if state == State.SCHEDULED:
+            assert executor.stuck_tasks_last_check_time != last_check_time  # should be updated
+        else:
+            assert executor.stuck_tasks_last_check_time == last_check_time  # should not be updated
+        session.flush()
+        ti = session.query(TaskInstance).filter(TaskInstance.task_id == ti.task_id).one()
+        assert ti.state == state
+
+    @pytest.mark.backend("mysql", "postgres")
+    def test_clear_stuck_queued_task_will_not_clear_task_which_is_not_pending_in_celery(
+        self,
+        session,
+        create_task_instance,
+    ):
+        """Here we test that task are not cleared if found in celery"""
+        ti = create_task_instance(state=State.QUEUED)
+        ti.queued_dttm = timezone.utcnow() - timedelta(days=2)
+        ti.external_executor_id = '231'
+        ti.dag_run.state = State.RUNNING
+        session.merge(ti)
+        session.flush()
+        executor = celery_executor.CeleryExecutor()
+        executor.bulk_state_fetcher = mock.MagicMock()
+        executor.bulk_state_fetcher.get_many.return_value = {
+            '231': ("STARTED", None)
+        }
+        executor.tasks = {ti.key: AsyncResult("231")}
+        executor._clear_stuck_queued_tasks()
+        session.flush()
+        ti = session.query(TaskInstance).filter(TaskInstance.task_id == ti.task_id).one()
+        assert ti.state == State.QUEUED
+
+    @pytest.mark.backend("mysql", "postgres")
+    def test_clear_stuck_queued_task_will_not_clear_task_it_doesnt_own(
+        self,
+        session,
+        create_task_instance,
+    ):
+        ti = create_task_instance(state=State.QUEUED)
+        ti.queued_dttm = timezone.utcnow() - timedelta(days=2)
+        ti.external_executor_id = '231'
+        ti.dag_run.state = State.RUNNING
+        session.merge(ti)
+        session.flush()
+        executor = celery_executor.CeleryExecutor()
+        executor._clear_stuck_queued_tasks()
+        session.flush()
+        ti = session.query(TaskInstance).filter(TaskInstance.task_id == ti.task_id).one()
+        assert ti.state == State.QUEUED
+
+
+    @pytest.mark.backend("mysql", "postgres")
+    def test_clear_stuck_queued_task_will_not_clear_task_for_non_running_dagruns(
+        self,
+        session,
+        create_task_instance,
+    ):
+        ti = create_task_instance(state=State.QUEUED)
+        ti.queued_dttm = timezone.utcnow() - timedelta(days=2)
+        ti.external_executor_id = '231'
+        ti.dag_run.state = State.SUCCESS
+        session.merge(ti)
+        session.flush()
+        executor = celery_executor.CeleryExecutor()
+        executor.tasks = {ti.key: AsyncResult("231")}
+        executor._clear_stuck_queued_tasks()
+        session.flush()
+        ti = session.query(TaskInstance).filter(TaskInstance.task_id == ti.task_id).one()
+        assert ti.state == State.QUEUED
 
 def test_operation_timeout_config():
     assert celery_executor.OPERATION_TIMEOUT == 1
