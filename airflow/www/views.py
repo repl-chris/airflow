@@ -217,7 +217,11 @@ def get_date_time_num_runs_dag_runs_form_data(www_request, session, dag):
 
     # Happens if base_date was changed and the selected dag run is not in result
     if not dr_state and drs:
-        dr = drs[0]
+        dr = session.query(DagRun).filter(DagRun.dag_id == dag.dag_id, DagRun.execution_date == date_time).one_or_none()
+        if dr:
+            dr_choices.append((dr.execution_date.isoformat(), dr.run_id))
+        else:
+            dr = drs[0]
         date_time = dr.execution_date
         dr_state = dr.state
 
