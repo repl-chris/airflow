@@ -446,7 +446,10 @@ class CeleryExecutor(BaseExecutor):
             self.queued_tasks.pop(task.key, None)
             celery_async_result = self.tasks.pop(task.key, None)
             if celery_async_result:
-                celery_async_result.revoke()
+                try:
+                    app.control.revoke(celery_async_result.task_id)
+                except Exception as ex:
+                    self.log.info("Error revoking task %s from celery: %s", task, ex)
 
 
     def debug_dump(self) -> None:
@@ -535,7 +538,7 @@ class CeleryExecutor(BaseExecutor):
 
         for ti in tis:
             if ti.external_executor_id is not None:
-                celery_tasks[ti.external_executor_id] = (AsyncResult(ti.external_executor_id, app=app), ti)
+                celery_tasks[ti.external_executor_id] = (AsyncResult(ti.external_executor_id), ti)
             else:
                 not_adopted_tis.append(ti)
 
