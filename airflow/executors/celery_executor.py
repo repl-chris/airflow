@@ -405,6 +405,7 @@ class CeleryExecutor(BaseExecutor):
             .join(TaskInstance.dag_run)
             .filter(
                 TaskInstance.state == State.QUEUED,
+                TaskInstance.queued_by_job_id == self.job_id,
                 DagRun.state == State.RUNNING,
                 TaskInstance.queued_dttm < max_allowed_time,
             )
@@ -440,10 +441,12 @@ class CeleryExecutor(BaseExecutor):
             task.state = State.SCHEDULED
             task.queued_dttm = None
             session.merge(task)
-            self.tasks.pop(task.key, None)
             self.adopted_task_timeouts.pop(task.key, None)
             self.running.discard(task.key)
             self.queued_tasks.pop(task.key, None)
+            celery_async_result = self.tasks.pop(task.key, None)
+            if celery_async_result:
+                celery_async_result.revoke()
 
 
     def debug_dump(self) -> None:
