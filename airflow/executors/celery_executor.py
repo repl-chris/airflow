@@ -535,7 +535,7 @@ class CeleryExecutor(BaseExecutor):
 
         for ti in tis:
             if ti.external_executor_id is not None:
-                celery_tasks[ti.external_executor_id] = (AsyncResult(ti.external_executor_id), ti)
+                celery_tasks[ti.external_executor_id] = (AsyncResult(ti.external_executor_id, app=app), ti)
             else:
                 not_adopted_tis.append(ti)
 
