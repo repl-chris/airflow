@@ -83,11 +83,16 @@ class TestListPyFilesPath(unittest.TestCase):
             "test_invalid_cron.py",
             "test_invalid_param.py",
             "test_ignore_this.py",
+            "test_invalid_symlink.py",
+        ]
+        should_not_ignore = [
+            "test_valid_symlink.py",
         ]
         files = find_path_from_directory(TEST_DAGS_FOLDER, ".airflowignore")
 
         assert files
         assert all(os.path.basename(file) not in should_ignore for file in files)
+        assert all(os.path.basename(file) in should_not_ignore for file in files)
 
     def test_find_path_from_directory_glob_ignore(self):
         should_ignore = [

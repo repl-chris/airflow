@@ -56,10 +56,17 @@ class TestIgnorePluginFile(unittest.TestCase):
             ["subdir1/test_noneload_sub1.py", 'raise Exception("This file should have been ignored!")'],
             ["subdir2/test_shouldignore.py", 'raise Exception("This file should have been ignored!")'],
             ["subdir3/test_notload_sub3.py", 'raise Exception("This file should have been ignored!")'],
+            ["test_notload_linktarget.py", '#Should not be loaded directly, but should be loaded via symlink'],
+        ]
+        symlinks = [
+            ["test_notload_linktarget.py", "test_load_symlink.py"],
+            ["test_load.py", "test_notload_symlink.py"],
         ]
         for file_path, content in files_content:
             with open(os.path.join(self.plugin_folder_path, file_path), "w") as f:
                 f.write(content)
+        for target, link in symlinks:
+            os.symlink(os.path.join(self.plugin_folder_path, target), os.path.join(self.plugin_folder_path, link))
         self.mock_plugins_folder = patch.object(
             settings, 'PLUGINS_FOLDER', return_value=self.plugin_folder_path
         )
@@ -82,10 +89,13 @@ class TestIgnorePluginFile(unittest.TestCase):
             'test_noneload_sub1.py',
             'test_shouldignore.py',
             '.airflowignore_glob',
+            'test_notload_symlink.py',
+            'test_notload_linktarget.py',
         }
         should_not_ignore_files = {
             'test_load.py',
             'test_load_sub1.py',
+            'test_load_symlink.py',
         }
         ignore_list_file = ".airflowignore"
         for file_path in find_path_from_directory(self.plugin_folder_path, ignore_list_file):
@@ -109,10 +119,13 @@ class TestIgnorePluginFile(unittest.TestCase):
             'test_notload_sub.py',
             'test_noneload_sub1.py',
             'test_shouldignore.py',
+            'test_notload_symlink.py',
+            'test_notload_linktarget.py',
         }
         should_not_ignore_files = {
             'test_load.py',
             'test_load_sub1.py',
+            'test_load_symlink.py',
         }
         ignore_list_file = ".airflowignore_glob"
         for file_path in find_path_from_directory(self.plugin_folder_path, ignore_list_file, "glob"):
